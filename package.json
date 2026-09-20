@@ -1,0 +1,24 @@
+{
+  "name": "guardtab",
+  "private": true,
+  "version": "0.1.0",
+  "description": "GuardTab — Chrome Extension + Node.js Backend + PostgreSQL security & privacy inspector",
+  "workspaces": [
+    "shared",
+    "backend"
+  ],
+  "scripts": {
+    "build": "npm run build --workspace=shared && npm run build --workspace=backend",
+    "dev:backend": "npm run dev --workspace=backend",
+    "test": "npm run test --workspace=backend",
+    "lint": "npm run lint --workspace=backend",
+    "typecheck": "npm run typecheck --workspace=backend",
+    "docker:up": "docker compose up -d",
+    "docker:down": "docker compose down",
+    "prisma:generate": "npm run prisma:generate --workspace=backend",
+    "prisma:migrate": "npm run prisma:migrate --workspace=backend"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  }
+}

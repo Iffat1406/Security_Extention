@@ -1,0 +1,193 @@
+// GuardTab — Prisma schema
+//
+// Phase 1 (users, scan_results, user_settings) plus Phase 2 — Authentication
+// & RBAC (§32 roadmap): `role` on users, refresh_tokens, audit_logs.
+//
+// scan_results already carries the corrected column set from §25.1 (the
+// "checklist for the first Prisma migration after Phase 0") rather than the
+// superseded Part I shape — e.g. `url` is never persisted, and
+// registrable_domain/host/path/scan_status/scores/risk_band/evidence exist
+// from day one, even though nothing populates the score/evidence columns
+// until the risk engine (Phase 6) and reputation checks (Phase 5) exist.
+//
+// Deliberately NOT in this schema yet, because their owning phase hasn't
+// been built: deletion/export columns on users (§25.2, Phase 11 —
+// retention), scan_chats (Phase 7 — AI chat), domains/threat_indicators/
+// scan_feedback (Phase 10 — threat intelligence).
+
+generator client {
+  provider        = "prisma-client-js"
+  previewFeatures = ["postgresqlExtensions"]
+}
+
+datasource db {
+  provider   = "postgresql"
+  url        = env("DATABASE_URL")
+  extensions = [pgcrypto]
+}
+
+/// §24.1 — scan lifecycle states.
+enum ScanStatus {
+  PENDING
+  SCANNING
+  PARTIAL
+  COMPLETED
+  FAILED
+  NOT_SUPPORTED
+}
+
+/// §19 — deterministic risk engine output band.
+enum RiskBand {
+  SAFE
+  LOW
+  MEDIUM
+  HIGH
+  CRITICAL
+}
+
+/// §21.1 — RBAC roles. Never inferred from the client; always read from the
+/// database on every privileged request (§21.3), not from a JWT claim.
+enum Role {
+  USER
+  ANALYST
+  ADMIN
+}
+
+/// §10 "Table: users" plus the `role` column from §25.2 (Phase 2). Deletion/
+/// export columns from §25.2 land with Phase 11 — retention.
+model User {
+  id          String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  googleId    String   @unique @map("google_id") @db.VarChar(255)
+  email       String   @unique @db.VarChar(255)
+  displayName String   @map("display_name") @db.VarChar(255)
+  avatarUrl   String?  @map("avatar_url")
+  role        Role     @default(USER)
+  createdAt   DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  lastSeenAt  DateTime @default(now()) @map("last_seen_at") @db.Timestamptz(6)
+  isActive    Boolean  @default(true) @map("is_active")
+
+  scanResults   ScanResult[]
+  settings      UserSettings?
+  refreshTokens RefreshToken[]
+  auditLogs     AuditLog[]
+
+  @@map("users")
+}
+
+/// §10 "Table: refresh_tokens", extended with `family_id` to implement the
+/// reuse-detection design in §18.3/§26.5: every token issued by rotating an
+/// existing one keeps the same family_id as the token it replaced. Replaying
+/// an already-rotated (revoked) token therefore lets us revoke every token
+/// ever issued in that family, not just the one that was replayed.
+model RefreshToken {
+  id     String @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  userId String @map("user_id") @db.Uuid
+  user   User   @relation(fields: [userId], references: [id])
+
+  /// SHA-256 hash of the refresh token — the raw token is never stored (§13, §18.1).
+  tokenHash String   @unique @map("token_hash") @db.VarChar(255)
+  familyId  String   @map("family_id") @db.Uuid
+  expiresAt DateTime @map("expires_at") @db.Timestamptz(6)
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  /// Set when this token is rotated out, replayed (reuse detection), or the
+  /// user logs out / is suspended. NULL means "currently valid".
+  revokedAt DateTime? @map("revoked_at") @db.Timestamptz(6)
+
+  // No separate index on tokenHash: @unique above already creates one
+  // (matching §10's idx_refresh_tokens_token_hash intent) — a second
+  // explicit index on the same single column would just be a duplicate
+  // B-tree that every write pays for and nothing reads.
+  @@index([familyId], map: "idx_refresh_tokens_family_id")
+  @@map("refresh_tokens")
+}
+
+/// §28.4 "Table: audit_logs". Append-only — no route updates or deletes a
+/// row; retention is a cleanup job's job (Phase 11), not application code.
+model AuditLog {
+  id     String  @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  userId String? @map("user_id") @db.Uuid
+  user   User?   @relation(fields: [userId], references: [id])
+
+  /// One of the fixed event names in §28.4 (LOGIN, TOKEN_REUSE_DETECTED, ADMIN_ROLE_CHANGE, ...).
+  action       String  @db.VarChar(32)
+  /// user | scan | domain | indicator | settings | token
+  resourceType String? @map("resource_type") @db.VarChar(32)
+  resourceId   String? @map("resource_id") @db.VarChar(64)
+  /// SHA-256 of the IP with a server-side salt — never the raw address (§28.4, §28.1 redaction rules).
+  ipHash       String? @map("ip_hash") @db.Char(64)
+  userAgent    String? @map("user_agent") @db.VarChar(255)
+  /// Before/after values for role changes and overrides. Never PII (§28.4).
+  metadata     Json?
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  @@index([userId, createdAt(sort: Desc)], map: "idx_audit_actor_created")
+  @@map("audit_logs")
+}
+
+/// §10 "Table: scan_results" as corrected by §25.1. One row per domain scan
+/// per user; NULL user_id means an anonymous (not-persisted-for-history) scan.
+model ScanResult {
+  id     String  @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  userId String? @map("user_id") @db.Uuid
+  user   User?   @relation(fields: [userId], references: [id])
+
+  /// Public Suffix List result — the dedup/join key. Replaces Part I's `domain`.
+  registrableDomain String @map("registrable_domain") @db.VarChar(255)
+  /// Full hostname including subdomain, punycode form.
+  host String @db.VarChar(255)
+  /// Normalised path, redacted and truncated (§20.1). NULL for "/" (see §17.2).
+  path String? @db.VarChar(200)
+
+  scanStatus  ScanStatus @default(PENDING) @map("scan_status")
+  scannedAt   DateTime   @default(now()) @map("scanned_at") @db.Timestamptz(6)
+  startedAt   DateTime?  @map("started_at") @db.Timestamptz(6)
+  completedAt DateTime?  @map("completed_at") @db.Timestamptz(6)
+
+  // Per-checker raw results. Populated starting Phase 4 (local checkers) and
+  // Phase 5 (backend reputation). NULLABLE JSONB by design (§10).
+  safeBrowsingData   Json? @map("safe_browsing_data")
+  sslData            Json? @map("ssl_data")
+  headersData        Json? @map("headers_data")
+  trackerData        Json? @map("tracker_data")
+  passwordBreachData Json? @map("password_breach_data")
+  domainAgeData      Json? @map("domain_age_data")
+  jsVulnData         Json? @map("js_vuln_data")
+  mixedContentData   Json? @map("mixed_content_data")
+  /// Per-check status map (§24.3) — populated once checkers exist.
+  checkStatus Json? @map("check_status")
+
+  // Deterministic risk engine output (§19, §25.1). Populated starting Phase 6.
+  securityScore     Int?      @map("security_score")
+  privacyScore      Int?      @map("privacy_score")
+  overallScore      Int?      @map("overall_score")
+  riskBand          RiskBand? @map("risk_band")
+  riskEvidence      Json?     @map("risk_evidence")
+  riskEngineVersion String?   @map("risk_engine_version") @db.VarChar(16)
+  scannerVersion    String?   @map("scanner_version") @db.VarChar(16)
+  /// Payload contract version — lets the backend accept older extension builds.
+  schemaVersion Int @default(1) @map("schema_version")
+
+  /// AI-generated plain-English explanation only — AI never produces a score (§25.1).
+  aiExplanation String? @map("ai_explanation")
+
+  @@index([userId], map: "idx_scan_results_user_id")
+  @@index([registrableDomain, scannedAt(sort: Desc)], map: "idx_scan_registrable_scanned")
+  @@index([userId, scannedAt(sort: Desc)], map: "idx_scan_user_scanned")
+  @@index([scanStatus, scannedAt], map: "idx_scan_status_scanned")
+  @@map("scan_results")
+}
+
+/// §23.4 "Settings storage" (introduced in §25.3 as a new table, built in Phase 1).
+model UserSettings {
+  userId String @id @map("user_id") @db.Uuid
+  user   User   @relation(fields: [userId], references: [id])
+
+  /// Flag map, validated against a Zod schema on write (§23.4). Unknown keys rejected.
+  settings Json @default("{}")
+  /// Registrable domains, normalised on write, max 200 entries — enforced in the service layer.
+  excludedDomains String[] @map("excluded_domains")
+  updatedAt       DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  @@map("user_settings")
+}

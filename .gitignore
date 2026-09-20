@@ -1,0 +1,36 @@
+# Dependencies
+node_modules/
+
+# Environment
+.env
+.env.local
+*.env
+!.env.example
+
+# Build output
+dist/
+build/
+*.tsbuildinfo
+
+# Extension build output
+extension/dist/
+*.zip
+
+# Prisma
+backend/prisma/*.db
+
+# Logs
+*.log
+npm-debug.log*
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/*
+!.vscode/extensions.json
+
+# Test / coverage
+coverage/
+
+# Docker volumes (local only)
+.docker-data/

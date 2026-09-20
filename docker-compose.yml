@@ -1,0 +1,38 @@
+name: guardtab
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: guardtab-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: guardtab
+      POSTGRES_PASSWORD: guardtab_dev_password
+      POSTGRES_DB: guardtab
+    ports:
+      # Host port 5433 (not 5432) — this machine already has a native
+      # PostgreSQL service bound to 5432; mapping to the same host port
+      # would silently connect to that instead of this container.
+      - "5433:5432"
+    volumes:
+      - guardtab_postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U guardtab -d guardtab"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # Redis is added in Phase 2 (dedup cache, rate limits) and used as a BullMQ
+  # broker from Phase 10 onwards. Not required for Phase 1.
+  # redis:
+  #   image: redis:7-alpine
+  #   container_name: guardtab-redis
+  #   restart: unless-stopped
+  #   ports:
+  #     - "6379:6379"
+  #   volumes:
+  #     - guardtab_redis_data:/data
+
+volumes:
+  guardtab_postgres_data:
+  # guardtab_redis_data:
