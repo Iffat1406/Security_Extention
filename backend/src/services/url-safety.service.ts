@@ -45,8 +45,15 @@ export interface ValidatedOutboundUrl {
  * resolves it and checks every returned address. Throws an AppError with
  * the exact code from §20.5 on any failure — callers must never attempt
  * the request anyway on catch.
+ *
+ * `lookup` is injectable so tests can exercise the real guard against
+ * controlled DNS answers (e.g. a public name that resolves to 10.0.0.5).
  */
-export async function validateOutboundUrl(rawUrl: string): Promise<ValidatedOutboundUrl> {
+export type DnsLookup = (hostname: string) => Promise<Array<{ address: string; family: number }>>;
+
+export const systemDnsLookup: DnsLookup = (hostname) => dns.lookup(hostname, { all: true });
+
+export async function validateOutboundUrl(rawUrl: string, lookup: DnsLookup = systemDnsLookup): Promise<ValidatedOutboundUrl> {
   if (rawUrl.length > 2048) {
     throw new AppError('URL_TOO_LONG', 'URL exceeds 2048 characters');
   }
@@ -93,7 +100,7 @@ export async function validateOutboundUrl(rawUrl: string): Promise<ValidatedOutb
   // is rejected even though the hostname itself looked fine.
   let addresses: { address: string; family: number }[];
   try {
-    addresses = await dns.lookup(hostname, { all: true });
+    addresses = await lookup(hostname);
   } catch {
     throw new AppError('UNRESOLVABLE_HOST', `Hostname "${hostname}" could not be resolved`);
   }
@@ -131,23 +138,70 @@ export interface SafeFetchResult {
   finalUrl: string;
 }
 
+export interface SafeFetchOptions {
+  method?: Dispatcher.HttpMethod;
+  headers?: Record<string, string>;
+  body?: string;
+  /** Total budget across all hops. Capped at the §20.4 maximum of 10s. */
+  timeoutMs?: number;
+  /** Response size cap. Capped at the §20.4 maximum of 1MB. */
+  maxBytes?: number;
+  /** Caller's own abort signal (e.g. an SDK's per-request timeout). */
+  signal?: AbortSignal;
+  /**
+   * For fixed first-party API hosts only (never a user-supplied URL): raises
+   * the time cap to 30s so Claude chat can use its §24.4 15s budget. The
+   * §20.4 10s cap is about URLs an attacker chose; the destination here is a
+   * constant in our code. Every other guard still applies.
+   */
+  fixedApiDestination?: boolean;
+}
+
+const FIXED_API_TIMEOUT_CAP_MS = 30000;
+
 /**
- * Fetches a user-supplied URL through the full SSRF guard: validates and
- * pins an IP before every hop, never follows a redirect automatically
- * (each hop is re-validated from scratch), and enforces the timeout and
- * response-size caps from §20.4.
+ * Fetches a URL through the full SSRF guard: validates and pins an IP
+ * before every hop, never follows a redirect automatically (each hop is
+ * re-validated from scratch), and enforces the timeout and response-size
+ * caps from §20.4. Every outbound call the backend makes goes through here,
+ * including calls to fixed third-party APIs (§20.4 warning box).
+ *
+ * Redirects are only followed for GET/HEAD — a POST body is never re-sent
+ * to a host the caller didn't choose.
  */
-export async function safeFetch(
-  initialUrl: string,
-  init: { method?: Dispatcher.HttpMethod; headers?: Record<string, string> } = {}
-): Promise<SafeFetchResult> {
-  const deadline = Date.now() + TOTAL_TIMEOUT_MS;
+export async function safeFetch(initialUrl: string, init: SafeFetchOptions = {}): Promise<SafeFetchResult> {
+  const method = init.method ?? 'GET';
+  const timeoutCap = init.fixedApiDestination ? FIXED_API_TIMEOUT_CAP_MS : TOTAL_TIMEOUT_MS;
+  const totalTimeout = Math.min(init.timeoutMs ?? TOTAL_TIMEOUT_MS, timeoutCap);
+  const maxBytes = Math.min(init.maxBytes ?? MAX_RESPONSE_BYTES, MAX_RESPONSE_BYTES);
+  const followRedirects = method === 'GET' || method === 'HEAD';
+  const deadline = Date.now() + totalTimeout;
+  // A real end-to-end deadline: headers/body timeouts alone are idle
+  // timeouts, so a slow-drip response could otherwise run past the budget.
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), totalTimeout);
+  const onCallerAbort = () => controller.abort();
+  if (init.signal?.aborted) controller.abort();
+  init.signal?.addEventListener('abort', onCallerAbort, { once: true });
   let currentUrl = initialUrl;
 
+  try {
+    return await fetchHops();
+  } catch (error) {
+    if (controller.signal.aborted && !(error instanceof AppError)) {
+      throw new AppError('EXTERNAL_SERVICE_UNAVAILABLE', 'Outbound request timed out', { reason: 'TIMEOUT' });
+    }
+    throw error;
+  } finally {
+    clearTimeout(timer);
+    init.signal?.removeEventListener('abort', onCallerAbort);
+  }
+
+  async function fetchHops(): Promise<SafeFetchResult> {
   for (let hop = 0; hop <= MAX_REDIRECTS; hop++) {
     const remaining = deadline - Date.now();
     if (remaining <= 0) {
-      throw new AppError('EXTERNAL_SERVICE_UNAVAILABLE', 'Outbound request exceeded the total time budget');
+      throw new AppError('EXTERNAL_SERVICE_UNAVAILABLE', 'Outbound request exceeded the total time budget', { reason: 'TIMEOUT' });
     }
 
     // Re-validated on every hop, including the first — a redirect target is
@@ -168,15 +222,17 @@ export async function safeFetch(
 
     try {
       const response = await undiciRequest(parsedUrl, {
-        method: init.method ?? 'GET',
+        method,
         headers: { ...init.headers, host: parsedUrl.host },
+        body: init.body,
         dispatcher: agent,
         maxRedirections: 0,
-        bodyTimeout: Math.min(remaining, TOTAL_TIMEOUT_MS),
-        headersTimeout: Math.min(remaining, TOTAL_TIMEOUT_MS),
+        signal: controller.signal,
+        bodyTimeout: remaining,
+        headersTimeout: remaining,
       });
 
-      if (response.statusCode >= 300 && response.statusCode < 400) {
+      if (followRedirects && response.statusCode >= 300 && response.statusCode < 400) {
         response.body.destroy();
         const location = response.headers.location;
         const locationValue = Array.isArray(location) ? location[0] : location;
@@ -191,9 +247,9 @@ export async function safeFetch(
       let total = 0;
       for await (const chunk of response.body) {
         total += (chunk as Buffer).length;
-        if (total > MAX_RESPONSE_BYTES) {
+        if (total > maxBytes) {
           response.body.destroy();
-          throw new AppError('EXTERNAL_SERVICE_UNAVAILABLE', 'Response exceeded the 1MB cap');
+          throw new AppError('EXTERNAL_SERVICE_UNAVAILABLE', 'Response exceeded the size cap', { reason: 'TOO_LARGE' });
         }
         chunks.push(chunk as Buffer);
       }
@@ -205,4 +261,33 @@ export async function safeFetch(
   }
 
   throw new AppError('EXTERNAL_SERVICE_UNAVAILABLE', `Too many redirects (max ${MAX_REDIRECTS})`);
+  }
+}
+
+/**
+ * fetch()-compatible adapter over safeFetch, for SDKs that accept a custom
+ * `fetch` (the Anthropic SDK). Non-streaming only — the whole body is
+ * buffered under the 1MB cap, which is all a short JSON reply needs.
+ */
+export async function guardedFetch(input: string | URL | Request, init: RequestInit = {}): Promise<Response> {
+  const url = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url;
+  const headers: Record<string, string> = {};
+  new Headers(init.headers ?? (input instanceof Request ? input.headers : undefined)).forEach((value, key) => {
+    headers[key] = value;
+  });
+  const body = typeof init.body === 'string' ? init.body : init.body == null ? undefined : String(init.body);
+  const result = await safeFetch(url, {
+    method: (init.method ?? 'GET').toUpperCase() as Dispatcher.HttpMethod,
+    headers,
+    body,
+    signal: init.signal ?? undefined,
+    timeoutMs: FIXED_API_TIMEOUT_CAP_MS,
+    fixedApiDestination: true,
+  });
+  const responseHeaders = new Headers();
+  for (const [key, value] of Object.entries(result.headers)) {
+    if (value === undefined) continue;
+    for (const v of Array.isArray(value) ? value : [value]) responseHeaders.append(key, v);
+  }
+  return new Response(new Uint8Array(result.body), { status: result.statusCode, headers: responseHeaders });
 }

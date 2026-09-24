@@ -44,11 +44,15 @@ describe('§11 Authentication endpoints (excluding the live Google handshake)', 
         headers: { authorization: `Bearer ${token}` },
       });
       expect(response.statusCode).toBe(200);
+      // §11's { id, email, displayName, avatarUrl }, plus role (the dashboard
+      // shows admin navigation from it) and any pending deletion (§29.2).
       expect(response.json()).toEqual({
         id: user.id,
         email: user.email,
         displayName: user.displayName,
         avatarUrl: user.avatarUrl,
+        role: 'USER',
+        deletionRequestedAt: null,
       });
     });
 

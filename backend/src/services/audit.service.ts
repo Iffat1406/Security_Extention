@@ -34,7 +34,13 @@ export type AuditAction =
   | 'ADMIN_SUSPEND'
   | 'ADMIN_INDICATOR_OVERRIDE'
   | 'ADMIN_FEEDBACK_RESOLVE'
-  | 'FORBIDDEN_ACCESS_ATTEMPT';
+  | 'ADMIN_ALLOWLIST_CHANGE'
+  | 'FORBIDDEN_ACCESS_ATTEMPT'
+  /** §22.4 "Every reputation transition ... writes an audit row with the inputs that caused it". */
+  | 'REPUTATION_CHANGE'
+  /** §21.2 ANALYST "Propose" an indicator override — recorded for an ADMIN to act on. */
+  | 'ANALYST_OVERRIDE_PROPOSAL'
+  | 'SESSIONS_REVOKED';
 
 export interface AuditLogInput {
   userId?: string | null;

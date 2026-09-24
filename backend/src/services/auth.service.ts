@@ -22,13 +22,22 @@ const JWT_ALGORITHM = 'HS256' as const;
 export interface AccessTokenPayload {
   sub: string;
   role: Role;
+  /** Seconds since epoch of the actual Google sign-in (OIDC `auth_time`). */
+  authTime: number;
 }
 
-export function signAccessToken(user: Pick<User, 'id' | 'role'>): string {
-  return jwt.sign({ sub: user.id, role: user.role }, env.JWT_SECRET, {
-    algorithm: JWT_ALGORITHM,
-    expiresIn: env.JWT_ACCESS_TTL as jwt.SignOptions['expiresIn'],
-  });
+/**
+ * @param authenticatedAt When the user actually signed in with Google. A
+ *   refresh keeps the original value, so `auth_time` answers "how recently
+ *   did a human authenticate?" rather than "how recently was a token minted?"
+ *   — the question the export endpoint needs answered (§18.3).
+ */
+export function signAccessToken(user: Pick<User, 'id' | 'role'>, authenticatedAt: Date = new Date()): string {
+  return jwt.sign(
+    { sub: user.id, role: user.role, auth_time: Math.floor(authenticatedAt.getTime() / 1000) },
+    env.JWT_SECRET,
+    { algorithm: JWT_ALGORITHM, expiresIn: env.JWT_ACCESS_TTL as jwt.SignOptions['expiresIn'] }
+  );
 }
 
 /** Throws on any invalid token (bad signature, wrong/missing alg, expired,
@@ -38,7 +47,8 @@ export function verifyAccessToken(token: string): AccessTokenPayload {
   if (typeof decoded === 'string' || typeof decoded.sub !== 'string' || typeof decoded.role !== 'string') {
     throw new Error('Malformed access token payload');
   }
-  return { sub: decoded.sub, role: decoded.role as Role };
+  const authTime = typeof decoded.auth_time === 'number' ? decoded.auth_time : (decoded.iat ?? 0);
+  return { sub: decoded.sub, role: decoded.role as Role, authTime };
 }
 
 const REFRESH_TOKEN_BYTES = 48;
@@ -63,11 +73,15 @@ export interface IssuedRefreshToken {
 
 /** Issues a brand-new refresh token family — used at login only. Every
  * token later produced by rotating this one keeps the same familyId. */
-export async function issueRefreshToken(prisma: PrismaClient, userId: string): Promise<IssuedRefreshToken> {
+export async function issueRefreshToken(
+  prisma: PrismaClient,
+  userId: string,
+  authenticatedAt: Date = new Date()
+): Promise<IssuedRefreshToken> {
   const raw = generateRawRefreshToken();
   const familyId = randomUUID();
   await prisma.refreshToken.create({
-    data: { userId, tokenHash: hashRefreshToken(raw), familyId, expiresAt: refreshExpiry() },
+    data: { userId, tokenHash: hashRefreshToken(raw), familyId, authenticatedAt, expiresAt: refreshExpiry() },
   });
   return { raw, familyId };
 }
@@ -75,6 +89,7 @@ export async function issueRefreshToken(prisma: PrismaClient, userId: string): P
 export interface RotatedRefreshToken {
   user: User;
   raw: string;
+  authenticatedAt: Date;
 }
 
 type RotationOutcome =
@@ -82,7 +97,7 @@ type RotationOutcome =
   | { kind: 'reuse' }
   | { kind: 'expired' }
   | { kind: 'inactive' }
-  | { kind: 'rotated'; user: User; raw: string };
+  | { kind: 'rotated'; user: User; raw: string; authenticatedAt: Date };
 
 /**
  * §18.3/§26.5 refresh rotation with reuse detection. A valid refresh
@@ -137,11 +152,12 @@ export async function rotateRefreshToken(prisma: PrismaClient, rawToken: string)
         userId: existing.userId,
         tokenHash: hashRefreshToken(raw),
         familyId: existing.familyId,
+        authenticatedAt: existing.authenticatedAt,
         expiresAt: refreshExpiry(),
       },
     });
 
-    return { kind: 'rotated', user: existing.user, raw };
+    return { kind: 'rotated', user: existing.user, raw, authenticatedAt: existing.authenticatedAt };
   });
 
   switch (outcome.kind) {
@@ -154,7 +170,7 @@ export async function rotateRefreshToken(prisma: PrismaClient, rawToken: string)
     case 'inactive':
       throw new AppError('AUTH_INVALID', 'Account is not active');
     case 'rotated':
-      return { user: outcome.user, raw: outcome.raw };
+      return { user: outcome.user, raw: outcome.raw, authenticatedAt: outcome.authenticatedAt };
   }
 }
 
@@ -165,7 +181,7 @@ export async function revokeRefreshTokenByRaw(prisma: PrismaClient, rawToken: st
   await prisma.refreshToken.updateMany({ where: { tokenHash, revokedAt: null }, data: { revokedAt: new Date() } });
 }
 
-/** Used by account suspension (§21.4) and, later, "sign out all devices" (§29). */
+/** Account suspension (§21.4), deletion requests (§29.2) and "sign out all devices" (§29.4). */
 export async function revokeAllUserRefreshTokens(prisma: PrismaClient, userId: string): Promise<void> {
   await prisma.refreshToken.updateMany({ where: { userId, revokedAt: null }, data: { revokedAt: new Date() } });
 }

@@ -19,7 +19,9 @@ export const ERROR_CODES = [
   'UNRESOLVABLE_HOST',
   // General
   'SCAN_NOT_FOUND',
+  'NOT_FOUND',
   'VALIDATION_ERROR',
+  'PAYLOAD_TOO_LARGE',
   'RATE_LIMITED',
   'QUOTA_EXCEEDED',
   'EXTERNAL_SERVICE_UNAVAILABLE',
@@ -35,6 +37,12 @@ export const ERROR_CODE_HTTP_STATUS: Record<ErrorCode, number> = {
   TOKEN_REUSE_DETECTED: 401,
   FORBIDDEN: 403,
   SCAN_NOT_FOUND: 404,
+  // Generic 404 for anything that isn't a scan (users, domains, feedback,
+  // unmatched routes) — §25.5 only names SCAN_NOT_FOUND, but reusing it for a
+  // missing *user* would be misleading to API clients.
+  NOT_FOUND: 404,
+  // §26.5 "12MB JSON body posted to /scans -> 413 payload rejected before parsing".
+  PAYLOAD_TOO_LARGE: 413,
   INVALID_URL: 400,
   UNSUPPORTED_SCHEME: 400,
   BLOCKED_TARGET: 400,

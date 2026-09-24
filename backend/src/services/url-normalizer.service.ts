@@ -29,9 +29,12 @@ const LONG_NUMERIC_SEGMENT = /^[0-9]{8,}$/;
 // Alphanumeric run of 20+ chars mixing letters and digits — the shape of a
 // session id / API token / short-link slug rather than a real word.
 const LONG_TOKEN_SEGMENT = /^(?=.*[0-9])(?=.*[A-Za-z])[A-Za-z0-9_-]{20,}$/;
+// §17.2 "matches a UUID or JWT shape" — header.payload[.signature], base64url.
+const JWT_SEGMENT = /^eyJ[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{5,}(\.[A-Za-z0-9_-]*)?$/;
 
 function isHighEntropySegment(segment: string): boolean {
   return (
+    JWT_SEGMENT.test(segment) ||
     UUID_SEGMENT.test(segment) ||
     LONG_HEX_SEGMENT.test(segment) ||
     LONG_NUMERIC_SEGMENT.test(segment) ||
@@ -143,4 +146,27 @@ export function normalizeUrl(rawUrl: string): NormalizedUrl {
   const normalizedUrl = `${parsed.protocol}//${hostForUrl}${path ?? '/'}`;
 
   return { host, registrableDomain, path, normalizedUrl, mixedScriptHost };
+}
+
+/**
+ * §20.3 "When the full URL is passed to Safe Browsing or VirusTotal in
+ * memory, the following parameters are stripped first — those services do
+ * not need them and they are the highest-risk values in the string."
+ */
+export const SENSITIVE_QUERY_PARAMS: ReadonlySet<string> = new Set([
+  'token', 'access_token', 'id_token', 'refresh_token', 'auth', 'authorization',
+  'session', 'sessionid', 'sid', 'jwt', 'key', 'api_key', 'apikey', 'secret',
+  'password', 'passwd', 'pwd', 'pass', 'otp', 'code', 'state', 'nonce',
+  'email', 'e-mail', 'user', 'username', 'phone', 'ssn', 'account', 'acct',
+  'signature', 'sig', 'hash', 'reset', 'invite', 'confirmation',
+]);
+
+/** The URL as sent to reputation services: sensitive params and the fragment removed. Never persisted. */
+export function reputationLookupUrl(rawUrl: string): string {
+  const url = new URL(rawUrl);
+  url.hash = '';
+  for (const name of [...url.searchParams.keys()]) {
+    if (SENSITIVE_QUERY_PARAMS.has(name.toLowerCase())) url.searchParams.delete(name);
+  }
+  return url.toString();
 }

@@ -13,8 +13,9 @@ import { createTestUser, prisma } from './helpers/test-db';
 describe('signAccessToken / verifyAccessToken — §18.3 "JWT forgery or manipulation"', () => {
   it('round-trips a valid token', async () => {
     const user = await createTestUser();
-    const token = signAccessToken(user);
-    expect(verifyAccessToken(token)).toEqual({ sub: user.id, role: user.role });
+    const signedInAt = new Date('2026-09-01T10:00:00Z');
+    const token = signAccessToken(user, signedInAt);
+    expect(verifyAccessToken(token)).toEqual({ sub: user.id, role: user.role, authTime: Math.floor(signedInAt.getTime() / 1000) });
   });
 
   it('rejects a token signed with alg:none (§26.5 "JWT with alg set to none")', () => {

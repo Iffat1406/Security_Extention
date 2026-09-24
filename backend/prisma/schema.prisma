@@ -1,19 +1,21 @@
-// GuardTab — Prisma schema
+// GuardTab — Prisma schema. The schema is the contract (§10): change it
+// first, then run `prisma migrate dev`.
 //
-// Phase 1 (users, scan_results, user_settings) plus Phase 2 — Authentication
-// & RBAC (§32 roadmap): `role` on users, refresh_tokens, audit_logs.
+// Tables by owning section of the spec:
+//   users, scan_results, user_settings ........ §10, §23.4, §25.1, §25.2
+//   refresh_tokens, audit_logs ................ §10, §28.4
+//   scan_chats ................................ §10 (AI chat, 30-day retention §29.1)
+//   domains, threat_indicators, scan_feedback . §22
+//   reputation_cache .......................... §24.4 budgets (cross-user dedup + TTL caches)
+//   daily_stats ............................... §28.5 aggregate_daily_stats
+//   ai_usage .................................. §33.3 "set a monthly spend cap"
 //
-// scan_results already carries the corrected column set from §25.1 (the
-// "checklist for the first Prisma migration after Phase 0") rather than the
-// superseded Part I shape — e.g. `url` is never persisted, and
-// registrable_domain/host/path/scan_status/scores/risk_band/evidence exist
-// from day one, even though nothing populates the score/evidence columns
-// until the risk engine (Phase 6) and reputation checks (Phase 5) exist.
+// Design rule (§17.5): a column exists only if it is needed to produce a
+// risk score, to deduplicate a scan, or to render the user's own dashboard.
 //
-// Deliberately NOT in this schema yet, because their owning phase hasn't
-// been built: deletion/export columns on users (§25.2, Phase 11 —
-// retention), scan_chats (Phase 7 — AI chat), domains/threat_indicators/
-// scan_feedback (Phase 10 — threat intelligence).
+// Foreign keys that hang off a user are ON DELETE CASCADE so account
+// deletion (§29.2) cannot leave a partial trail; audit_logs is SET NULL so
+// deletion anonymises rather than erases the security record.
 
 generator client {
   provider        = "prisma-client-js"
@@ -36,7 +38,7 @@ enum ScanStatus {
   NOT_SUPPORTED
 }
 
-/// §19 — deterministic risk engine output band.
+/// §19.4 — deterministic risk engine output band.
 enum RiskBand {
   SAFE
   LOW
@@ -53,8 +55,70 @@ enum Role {
   ADMIN
 }
 
-/// §10 "Table: users" plus the `role` column from §25.2 (Phase 2). Deletion/
-/// export columns from §25.2 land with Phase 11 — retention.
+/// §22.1 domains.reputation.
+enum Reputation {
+  UNKNOWN
+  CLEAN
+  SUSPICIOUS
+  MALICIOUS
+}
+
+/// §22.2 indicator types.
+enum IndicatorType {
+  PHISHING
+  MALWARE
+  SCAM
+  SUSPICIOUS_DOMAIN
+  LOOKALIKE
+  TRACKER_HEAVY
+  FINGERPRINTING
+  VULNERABLE_JS
+  MIXED_CONTENT
+  EXPIRED_CERT
+  REDIRECT_ABUSE
+}
+
+/// §22.2 threat_indicators.source.
+enum IndicatorSource {
+  SAFE_BROWSING
+  VIRUSTOTAL
+  SCANNER
+  COMMUNITY
+  ADMIN
+}
+
+/// §22.2 threat_indicators.severity.
+enum IndicatorSeverity {
+  LOW
+  MEDIUM
+  HIGH
+  CRITICAL
+}
+
+/// §22.3 scan_feedback.feedback_type.
+enum FeedbackType {
+  FALSE_POSITIVE
+  FALSE_NEGATIVE
+  HELPFUL
+  NOT_HELPFUL
+}
+
+/// §22.3 scan_feedback.status.
+enum FeedbackStatus {
+  NEW
+  REVIEWING
+  CONFIRMED
+  REJECTED
+}
+
+/// External reputation services whose results are cached per domain (§24.4).
+enum ExternalService {
+  SAFE_BROWSING
+  VIRUSTOTAL
+  WHOIS
+}
+
+/// §10 "Table: users" + §25.2 (role, deletion_requested_at, deleted_at, last_export_at).
 model User {
   id          String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
   googleId    String   @unique @map("google_id") @db.VarChar(255)
@@ -66,87 +130,49 @@ model User {
   lastSeenAt  DateTime @default(now()) @map("last_seen_at") @db.Timestamptz(6)
   isActive    Boolean  @default(true) @map("is_active")
 
-  scanResults   ScanResult[]
-  settings      UserSettings?
-  refreshTokens RefreshToken[]
-  auditLogs     AuditLog[]
+  /// §29.2 start of the 7-day deletion grace period. NULL = not requested.
+  deletionRequestedAt DateTime? @map("deletion_requested_at") @db.Timestamptz(6)
+  /// §25.2 "Set when the account is anonymised". Rows are deleted outright by
+  /// finalise_account_deletions, so in practice this is only ever observed
+  /// inside the deletion transaction.
+  deletedAt           DateTime? @map("deleted_at") @db.Timestamptz(6)
+  /// §29.3 enforces one export per 24 hours.
+  lastExportAt        DateTime? @map("last_export_at") @db.Timestamptz(6)
 
+  scanResults      ScanResult[]
+  settings         UserSettings?
+  refreshTokens    RefreshToken[]
+  auditLogs        AuditLog[]
+  scanChats        ScanChat[]
+  feedback         ScanFeedback[] @relation("FeedbackAuthor")
+  resolvedFeedback ScanFeedback[] @relation("FeedbackResolver")
+
+  @@index([deletionRequestedAt], map: "idx_users_deletion_requested")
   @@map("users")
 }
 
-/// §10 "Table: refresh_tokens", extended with `family_id` to implement the
-/// reuse-detection design in §18.3/§26.5: every token issued by rotating an
-/// existing one keeps the same family_id as the token it replaced. Replaying
-/// an already-rotated (revoked) token therefore lets us revoke every token
-/// ever issued in that family, not just the one that was replayed.
-model RefreshToken {
+/// §10 "Table: scan_results" as corrected by §25.1. One row per domain scan
+/// per signed-in user. Anonymous scans are never written here (§17.4).
+model ScanResult {
   id     String @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
   userId String @map("user_id") @db.Uuid
-  user   User   @relation(fields: [userId], references: [id])
-
-  /// SHA-256 hash of the refresh token — the raw token is never stored (§13, §18.1).
-  tokenHash String   @unique @map("token_hash") @db.VarChar(255)
-  familyId  String   @map("family_id") @db.Uuid
-  expiresAt DateTime @map("expires_at") @db.Timestamptz(6)
-  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
-  /// Set when this token is rotated out, replayed (reuse detection), or the
-  /// user logs out / is suspended. NULL means "currently valid".
-  revokedAt DateTime? @map("revoked_at") @db.Timestamptz(6)
-
-  // No separate index on tokenHash: @unique above already creates one
-  // (matching §10's idx_refresh_tokens_token_hash intent) — a second
-  // explicit index on the same single column would just be a duplicate
-  // B-tree that every write pays for and nothing reads.
-  @@index([familyId], map: "idx_refresh_tokens_family_id")
-  @@map("refresh_tokens")
-}
-
-/// §28.4 "Table: audit_logs". Append-only — no route updates or deletes a
-/// row; retention is a cleanup job's job (Phase 11), not application code.
-model AuditLog {
-  id     String  @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
-  userId String? @map("user_id") @db.Uuid
-  user   User?   @relation(fields: [userId], references: [id])
-
-  /// One of the fixed event names in §28.4 (LOGIN, TOKEN_REUSE_DETECTED, ADMIN_ROLE_CHANGE, ...).
-  action       String  @db.VarChar(32)
-  /// user | scan | domain | indicator | settings | token
-  resourceType String? @map("resource_type") @db.VarChar(32)
-  resourceId   String? @map("resource_id") @db.VarChar(64)
-  /// SHA-256 of the IP with a server-side salt — never the raw address (§28.4, §28.1 redaction rules).
-  ipHash       String? @map("ip_hash") @db.Char(64)
-  userAgent    String? @map("user_agent") @db.VarChar(255)
-  /// Before/after values for role changes and overrides. Never PII (§28.4).
-  metadata     Json?
-
-  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
-
-  @@index([userId, createdAt(sort: Desc)], map: "idx_audit_actor_created")
-  @@map("audit_logs")
-}
-
-/// §10 "Table: scan_results" as corrected by §25.1. One row per domain scan
-/// per user; NULL user_id means an anonymous (not-persisted-for-history) scan.
-model ScanResult {
-  id     String  @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
-  userId String? @map("user_id") @db.Uuid
-  user   User?   @relation(fields: [userId], references: [id])
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
 
   /// Public Suffix List result — the dedup/join key. Replaces Part I's `domain`.
-  registrableDomain String @map("registrable_domain") @db.VarChar(255)
+  registrableDomain String  @map("registrable_domain") @db.VarChar(255)
   /// Full hostname including subdomain, punycode form.
-  host String @db.VarChar(255)
-  /// Normalised path, redacted and truncated (§20.1). NULL for "/" (see §17.2).
-  path String? @db.VarChar(200)
+  host              String  @db.VarChar(255)
+  /// Normalised path, redacted and truncated (§17.2, §20.1). NULL for "/" or when path storage is off.
+  path              String? @db.VarChar(200)
 
   scanStatus  ScanStatus @default(PENDING) @map("scan_status")
   scannedAt   DateTime   @default(now()) @map("scanned_at") @db.Timestamptz(6)
   startedAt   DateTime?  @map("started_at") @db.Timestamptz(6)
   completedAt DateTime?  @map("completed_at") @db.Timestamptz(6)
 
-  // Per-checker raw results. Populated starting Phase 4 (local checkers) and
-  // Phase 5 (backend reputation). NULLABLE JSONB by design (§10).
+  // Per-checker results (§10). NULLABLE JSONB — flexible shape, still queryable.
   safeBrowsingData   Json? @map("safe_browsing_data")
+  virusTotalData     Json? @map("virus_total_data")
   sslData            Json? @map("ssl_data")
   headersData        Json? @map("headers_data")
   trackerData        Json? @map("tracker_data")
@@ -154,40 +180,250 @@ model ScanResult {
   domainAgeData      Json? @map("domain_age_data")
   jsVulnData         Json? @map("js_vuln_data")
   mixedContentData   Json? @map("mixed_content_data")
-  /// Per-check status map (§24.3) — populated once checkers exist.
-  checkStatus Json? @map("check_status")
+  fingerprintData    Json? @map("fingerprint_data")
+  /// §31.1 ordered { host, statusCode, hopType } — query strings stripped.
+  redirectData       Json? @map("redirect_data")
+  /// §31.2 best lookalike match, if any.
+  lookalikeData      Json? @map("lookalike_data")
+  /// Per-check status map (§24.3).
+  checkStatus        Json? @map("check_status")
 
-  // Deterministic risk engine output (§19, §25.1). Populated starting Phase 6.
+  // Deterministic risk engine output (§19, §25.1).
   securityScore     Int?      @map("security_score")
   privacyScore      Int?      @map("privacy_score")
   overallScore      Int?      @map("overall_score")
   riskBand          RiskBand? @map("risk_band")
+  /// §19.5 evidence array + skipped array.
   riskEvidence      Json?     @map("risk_evidence")
   riskEngineVersion String?   @map("risk_engine_version") @db.VarChar(16)
   scannerVersion    String?   @map("scanner_version") @db.VarChar(16)
   /// Payload contract version — lets the backend accept older extension builds.
-  schemaVersion Int @default(1) @map("schema_version")
+  schemaVersion     Int       @default(1) @map("schema_version")
+  /// SHA-256 over (domain, engine version, evidence) — the §24.4 "1-hour
+  /// cache per domain + engine version" key for AI explanations.
+  evidenceHash      String?   @map("evidence_hash") @db.VarChar(64)
 
-  /// AI-generated plain-English explanation only — AI never produces a score (§25.1).
+  /// AI-generated plain-English explanation only — AI never produces a score (§25.1, §19.8).
   aiExplanation String? @map("ai_explanation")
+  /// §19.8 optional "what should I do" line.
+  aiAdvice      String? @map("ai_advice")
 
-  @@index([userId], map: "idx_scan_results_user_id")
+  chats    ScanChat[]
+  feedback ScanFeedback[]
+
   @@index([registrableDomain, scannedAt(sort: Desc)], map: "idx_scan_registrable_scanned")
   @@index([userId, scannedAt(sort: Desc)], map: "idx_scan_user_scanned")
+  @@index([userId, registrableDomain], map: "idx_scan_user_domain")
   @@index([scanStatus, scannedAt], map: "idx_scan_status_scanned")
+  @@index([evidenceHash, scannedAt(sort: Desc)], map: "idx_scan_evidence_hash")
   @@map("scan_results")
 }
 
-/// §23.4 "Settings storage" (introduced in §25.3 as a new table, built in Phase 1).
+/// §23.4 "Settings storage".
 model UserSettings {
   userId String @id @map("user_id") @db.Uuid
-  user   User   @relation(fields: [userId], references: [id])
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
 
   /// Flag map, validated against a Zod schema on write (§23.4). Unknown keys rejected.
-  settings Json @default("{}")
+  settings        Json     @default("{}")
   /// Registrable domains, normalised on write, max 200 entries — enforced in the service layer.
   excludedDomains String[] @map("excluded_domains")
   updatedAt       DateTime @updatedAt @map("updated_at") @db.Timestamptz(6)
 
   @@map("user_settings")
+}
+
+/// §10 "Table: refresh_tokens", extended with `family_id` for reuse detection
+/// (§18.3/§26.5) and `authenticated_at` so a sensitive action can demand a
+/// fresh sign-in rather than merely a fresh token (§18.3 export mitigation).
+model RefreshToken {
+  id     String @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  userId String @map("user_id") @db.Uuid
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  /// SHA-256 hash of the refresh token — the raw token is never stored (§13, §18.1).
+  tokenHash       String    @unique @map("token_hash") @db.VarChar(255)
+  familyId        String    @map("family_id") @db.Uuid
+  /// When the user actually completed Google sign-in for this family. Copied across rotations.
+  authenticatedAt DateTime  @default(now()) @map("authenticated_at") @db.Timestamptz(6)
+  expiresAt       DateTime  @map("expires_at") @db.Timestamptz(6)
+  createdAt       DateTime  @default(now()) @map("created_at") @db.Timestamptz(6)
+  /// Set when rotated out, replayed (reuse detection), logged out or suspended. NULL = valid.
+  revokedAt       DateTime? @map("revoked_at") @db.Timestamptz(6)
+
+  // No separate index on tokenHash: @unique already creates one.
+  @@index([familyId], map: "idx_refresh_tokens_family_id")
+  @@index([expiresAt], map: "idx_refresh_tokens_expires")
+  @@map("refresh_tokens")
+}
+
+/// §28.4 "Table: audit_logs". Append-only — no route updates or deletes a row;
+/// retention is purge_audit_logs's job.
+model AuditLog {
+  id     String  @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  userId String? @map("user_id") @db.Uuid
+  user   User?   @relation(fields: [userId], references: [id], onDelete: SetNull)
+
+  action       String  @db.VarChar(32)
+  /// user | scan | domain | indicator | settings | token | feedback
+  resourceType String? @map("resource_type") @db.VarChar(32)
+  resourceId   String? @map("resource_id") @db.VarChar(64)
+  /// SHA-256 of the IP with a server-side salt — never the raw address.
+  ipHash       String? @map("ip_hash") @db.Char(64)
+  userAgent    String? @map("user_agent") @db.VarChar(255)
+  /// Before/after values for role changes and overrides. Never PII.
+  metadata     Json?
+
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  @@index([userId, createdAt(sort: Desc)], map: "idx_audit_actor_created")
+  @@index([action, createdAt(sort: Desc)], map: "idx_audit_action_created")
+  @@index([createdAt], map: "idx_audit_created")
+  @@map("audit_logs")
+}
+
+/// §10 "Table: scan_chats". 30-day retention (§29.1).
+model ScanChat {
+  id     String     @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  scanId String     @map("scan_id") @db.Uuid
+  scan   ScanResult @relation(fields: [scanId], references: [id], onDelete: Cascade)
+  userId String     @map("user_id") @db.Uuid
+  user   User       @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  /// user | assistant
+  role      String   @db.VarChar(20)
+  content   String
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  @@index([scanId, createdAt], map: "idx_chats_scan_created")
+  @@index([userId, createdAt], map: "idx_chats_user_created")
+  @@index([createdAt], map: "idx_chats_created")
+  @@map("scan_chats")
+}
+
+/// §22.1 "Table: domains" — describes a website, never a person.
+model Domain {
+  id                   String     @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  /// Registrable domain, punycode form.
+  domain               String     @unique @db.VarChar(255)
+  firstSeenAt          DateTime   @default(now()) @map("first_seen_at") @db.Timestamptz(6)
+  lastSeenAt           DateTime   @default(now()) @map("last_seen_at") @db.Timestamptz(6)
+  /// Incremented on every scan; decremented only when a contributing account is deleted (§29.2).
+  scanCount            Int        @default(0) @map("scan_count")
+  /// Distinct users — the anti-poisoning denominator (§22.4).
+  uniqueUserCount      Int        @default(0) @map("unique_user_count")
+  latestSecurityScore  Int?       @map("latest_security_score")
+  reputation           Reputation @default(UNKNOWN)
+  reputationConfidence Decimal    @default(0) @map("reputation_confidence") @db.Decimal(3, 2)
+  /// Cached WHOIS/RDAP result, refreshed every 7 days.
+  domainAgeDays        Int?       @map("domain_age_days")
+  isAllowlisted        Boolean    @default(false) @map("is_allowlisted")
+  updatedAt            DateTime   @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  indicators ThreatIndicator[]
+
+  @@index([reputation, reputationConfidence(sort: Desc)], map: "idx_domains_reputation")
+  @@map("domains")
+}
+
+/// §22.2 "Table: threat_indicators".
+model ThreatIndicator {
+  id       String            @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  domainId String            @map("domain_id") @db.Uuid
+  domain   Domain            @relation(fields: [domainId], references: [id], onDelete: Cascade)
+  type     IndicatorType
+  source   IndicatorSource
+  severity IndicatorSeverity
+  /// Source-weighted confidence for this one indicator.
+  confidence       Decimal   @db.Decimal(3, 2)
+  /// Engine names, CVE ids, similarity scores — never user data.
+  evidence         Json      @default("{}")
+  firstDetectedAt  DateTime  @default(now()) @map("first_detected_at") @db.Timestamptz(6)
+  /// Drives decay (§22.4).
+  lastDetectedAt   DateTime  @default(now()) @map("last_detected_at") @db.Timestamptz(6)
+  observationCount Int       @default(1) @map("observation_count")
+  /// ADMIN override. Suppressed indicators never score.
+  suppressedAt     DateTime? @map("suppressed_at") @db.Timestamptz(6)
+  suppressedReason String?   @map("suppressed_reason")
+
+  @@unique([domainId, type, source], map: "uq_indicator_domain_type_source")
+  @@index([domainId, type], map: "idx_indicators_domain_type")
+  @@index([lastDetectedAt(sort: Desc)], map: "idx_indicators_last_detected")
+  @@map("threat_indicators")
+}
+
+/// §22.3 "Table: scan_feedback".
+model ScanFeedback {
+  id             String         @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  /// SET NULL so feedback survives the scan being deleted (the domain is denormalised below).
+  scanId         String?        @map("scan_id") @db.Uuid
+  scan           ScanResult?    @relation(fields: [scanId], references: [id], onDelete: SetNull)
+  userId         String         @map("user_id") @db.Uuid
+  user           User           @relation("FeedbackAuthor", fields: [userId], references: [id], onDelete: Cascade)
+  domain         String         @db.VarChar(255)
+  feedbackType   FeedbackType   @map("feedback_type")
+  reportedSignal String?        @map("reported_signal") @db.VarChar(48)
+  /// Free text, 500-char cap, never rendered as HTML.
+  reason         String?        @db.VarChar(500)
+  status         FeedbackStatus @default(NEW)
+  resolvedById   String?        @map("resolved_by") @db.Uuid
+  resolvedBy     User?          @relation("FeedbackResolver", fields: [resolvedById], references: [id], onDelete: SetNull)
+  resolvedAt     DateTime?      @map("resolved_at") @db.Timestamptz(6)
+  createdAt      DateTime       @default(now()) @map("created_at") @db.Timestamptz(6)
+
+  /// "One feedback row per user per scan (UNIQUE constraint)".
+  @@unique([scanId, userId], map: "uq_feedback_scan_user")
+  @@index([domain, status], map: "idx_feedback_domain_status")
+  @@index([userId, createdAt], map: "idx_feedback_user_created")
+  @@map("scan_feedback")
+}
+
+/// Cross-user cache of external lookups (§24.4 budgets: Safe Browsing 10
+/// minutes, VirusTotal 1 hour, WHOIS 7 days).
+///
+/// Safe Browsing and VirusTotal verdicts are URL-level, so their key is the
+/// normalised URL (host + redacted path, never the query string). Keying
+/// them by registrable domain — the spec's literal wording — would let one
+/// phishing page on a shared host (sites.google.com/...) flag the whole
+/// domain for everyone, or let a phish ride on a cached "clean". WHOIS is
+/// genuinely per domain and is keyed by the registrable domain.
+model ReputationCache {
+  id        String          @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  cacheKey  String          @map("cache_key") @db.VarChar(512)
+  service   ExternalService
+  /// Normalised service result. Contains no user data.
+  result    Json
+  checkedAt DateTime        @default(now()) @map("checked_at") @db.Timestamptz(6)
+
+  @@unique([cacheKey, service], map: "uq_reputation_cache_key_service")
+  @@map("reputation_cache")
+}
+
+/// §28.5 aggregate_daily_stats — "Roll scan counts into a summary table so
+/// the dashboard does not scan raw history". No user identifiers (§29.1).
+model DailyStat {
+  date             DateTime @id @db.Date
+  scansTotal       Int      @default(0) @map("scans_total")
+  scansCompleted   Int      @default(0) @map("scans_completed")
+  scansPartial     Int      @default(0) @map("scans_partial")
+  scansFailed      Int      @default(0) @map("scans_failed")
+  uniqueDomains    Int      @default(0) @map("unique_domains")
+  avgSecurityScore Float?   @map("avg_security_score")
+  avgPrivacyScore  Float?   @map("avg_privacy_score")
+  updatedAt        DateTime @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  @@map("daily_stats")
+}
+
+/// §33.3 "set a monthly spend cap and an alert" for the Claude API.
+model AiUsage {
+  /// YYYY-MM
+  month            String   @id @db.VarChar(7)
+  calls            Int      @default(0)
+  inputTokens      BigInt   @default(0) @map("input_tokens")
+  outputTokens     BigInt   @default(0) @map("output_tokens")
+  estimatedCostUsd Decimal  @default(0) @map("estimated_cost_usd") @db.Decimal(10, 4)
+  updatedAt        DateTime @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
+
+  @@map("ai_usage")
 }

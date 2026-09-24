@@ -1,0 +1,25 @@
+{
+  "name": "@guardtab/extension",
+  "version": "0.1.0",
+  "private": true,
+  "description": "GuardTab Chrome Extension (Manifest V3)",
+  "scripts": {
+    "build": "node build.mjs",
+    "watch": "node build.mjs --watch",
+    "zip": "node scripts/zip.mjs",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run",
+    "data:update": "node scripts/update-data.mjs",
+    "icons": "node scripts/generate-icons.mjs",
+    "check:secrets": "node scripts/check-bundle-secrets.mjs"
+  },
+  "dependencies": {
+    "@guardtab/shared": "*"
+  },
+  "devDependencies": {
+    "@types/chrome": "^0.3.0",
+    "esbuild": "^0.28.2",
+    "typescript": "^5.6.3",
+    "vitest": "^5.0.0"
+  }
+}

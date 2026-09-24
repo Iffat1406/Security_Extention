@@ -2,18 +2,21 @@
   "name": "@guardtab/shared",
   "version": "0.1.0",
   "private": true,
-  "description": "Types and Zod schemas shared between the GuardTab backend and extension",
+  "description": "Types, Zod schemas and pure detection logic shared between the GuardTab backend and extension",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
   "scripts": {
     "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run",
     "clean": "rimraf dist"
   },
-  "devDependencies": {
-    "typescript": "^5.6.3",
-    "rimraf": "^6.0.1"
-  },
   "dependencies": {
-    "zod": "^3.23.8"
+    "zod": "^4.6.5"
+  },
+  "devDependencies": {
+    "rimraf": "^6.0.1",
+    "typescript": "^5.6.3",
+    "vitest": "^5.0.0"
   }
 }

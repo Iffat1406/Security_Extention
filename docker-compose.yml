@@ -24,7 +24,7 @@ services:
       timeout: 5s
       retries: 10
 
-    backend:
+  backend:
     build:
       context: .
       dockerfile: backend/Dockerfile
@@ -47,4 +47,3 @@ services:
 
 volumes:
   guardtab_postgres_data:
-  # guardtab_redis_data:

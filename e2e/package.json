@@ -1,0 +1,13 @@
+{
+  "name": "@guardtab/e2e",
+  "version": "0.1.0",
+  "private": true,
+  "description": "End-to-end journeys (§26.4): Chromium with the GuardTab extension loaded, against local fixture sites and a local backend",
+  "scripts": {
+    "test": "playwright test",
+    "install:browsers": "playwright install chromium"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.63.0"
+  }
+}
